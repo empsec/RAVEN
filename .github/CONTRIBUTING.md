@@ -47,8 +47,8 @@
 1. Clone your fork:
 
 ```bash
-    git clone https://github.com/MatrixTM26/RAVEN-C2-Framework.git
-    cd RAVEN-C2-Framework
+    git clone --branch contrib https://github.com/MatrixTM26/RAVEN.git
+    cd RAVEN
 ```
 
 1. Create a branch:
@@ -214,7 +214,7 @@ Benefits:
 
 - [GitHub](https://github.com/MatrixTM26)
 - [Email](mailto:anonymous999tm@gmail.com)
-- [Instagram](https://instagram.com/matrixtm26.xp)
+- [Instagram](https://instagram.com/matrix.tm26)
 
 ---
 
@@ -222,5 +222,15 @@ Benefits:
 > By contributing, you agree to follow all guidelines in this document.
 
 <p align="center">
-    &copy; 2023-2026 MatrixTM26
+    &copy;
+    Copyright 2023-2026 
+    <a href="https://github.com/matrixtm26">@MatrixTM26</a>
+    &nbsp;
+    &middot;
+    &nbsp;
+    All right reserved.
+    <br>
+    Licensed under
+    &nbsp;
+    <a href="./LICENSE">AGPL-V3</a>
 </p>
